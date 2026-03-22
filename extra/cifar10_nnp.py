@@ -25,7 +25,7 @@ def topk_loss(input, target, regularization="l2", regularization_strength=1.0):
     input = F.softmax(input, dim=-1)
 
     # computes ranks of logits
-    ranks = torchsort.soft_rank(input, regularization, regularization_strength)
+    ranks = torchsort.soft_rank_parallel(input, regularization, regularization_strength)
 
     # gather ranks at label
     ranks_label = ranks.gather(-1, target.view(-1, 1))
@@ -172,11 +172,12 @@ def main(args):
         if args.loss_fn == "topk"
         else ""
     )
-    np.save(f"{args.loss_fn}{regularization}_acc.npy", test_accs)
+    np.save(f"{args.loss_fn}{regularization}_parallel_acc.npy", test_accs)
 
-plt.style.use("bmh")
-palette = plt.rcParams['axes.prop_cycle'].by_key()['color']
+
 def plot():
+    plt.style.use("bmh")
+    palette = plt.rcParams['axes.prop_cycle'].by_key()['color']
     def smooth(xs, factor=0.9):
         out = [xs[0]]
         for x in xs[1:]:
@@ -186,17 +187,28 @@ def plot():
     # colors = ["tab:blue", "tab:orange"]
     plt.figure(figsize=(8, 5))
     for i, file in enumerate(Path("./").glob("*.npy")):
-        print(file)
-        test_accs = np.load(file)
-        plt.plot(test_accs, alpha=0.1, color=palette[i])
-        plt.plot(smooth(test_accs), color=palette[i], label=file.stem)
+        is_parallel = "parallel" in file.stem
+        ls = "--" if is_parallel else "-"
 
-    plt.ylim(0.78, 0.88)
+        test_accs = np.load(file)
+
+        # Always keep noisy line solid + faint
+        plt.plot(test_accs, alpha=0.3, color=palette[i], linestyle=ls)
+
+        # Apply linestyle ONLY to main (smoothed) curve
+        plt.plot(
+            smooth(test_accs),
+            color=palette[i],
+            label=file.stem,
+            linestyle=ls,
+        )
+
+    # plt.ylim(0.78, 0.88)
     plt.xlabel("Epochs")
     plt.ylabel("Test accuracy")
     plt.title("CIFAR-10")
     plt.legend()
-    plt.savefig("extra/cifar10_test_accuracy.png", dpi=150, bbox_inches="tight")
+    plt.savefig("extra/cifar10_test_accuracy_nnp.png", dpi=150, bbox_inches="tight")
 
 
 if __name__ == "__main__":
