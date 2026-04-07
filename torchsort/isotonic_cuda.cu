@@ -31,6 +31,7 @@
 
 #include <torch/extension.h>
 #include <c10/cuda/CUDAGuard.h>
+#include <cub/cub.cuh>
 
 //  Copied from fast-soft-sort (https://bit.ly/3r0gOav) with the following modifications:
 //  - replace numpy functions with torch equivalents
@@ -301,26 +302,85 @@ __global__ void isotonic_kl_backward_kernel(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Helper types for Phase 3 of isotonic_l2_parallel_kernel.
+//
+// ValFlag carries a (value, is_block_start) pair through a CUB inclusive
+// scan.  PropagateOp propagates values rightward from block starts:
+//   if right is a block start → use right's value
+//   otherwise               → carry left's value forward
+// The operator is associative, so CUB can use its tree-reduction internals.
+// ---------------------------------------------------------------------------
+template <typename scalar_t>
+struct ValFlag {
+    scalar_t val;   // representative value of the current PAV block
+    int      flag;  // 1 if this position is a PAV block start, else 0
+};
+
+template <typename scalar_t>
+struct PropagateOp {
+    __device__ ValFlag<scalar_t> operator()(
+            const ValFlag<scalar_t>& a,
+            const ValFlag<scalar_t>& b) const {
+        return b.flag ? b : ValFlag<scalar_t>{a.val, 0};
+    }
+};
+
+// ---------------------------------------------------------------------------
+// Optimisations over the original parallel kernel:
+//
+// 1. target stored as int32 (not scalar_t) — correct semantics, no float-
+//    precision issues for large n, no explicit casts in PAV traversal.
+//
+// 2. sh_last_block[512] in shared memory — after Phase 2a each thread saves
+//    the start of the last PAV block in its chunk.  Phase 2b then starts
+//    directly at that position instead of traversing from left_start.
+//    When sol[last_left] > sol[first_right] (no violation at the boundary),
+//    the merge is O(1): just inherit the right region's last block.  This
+//    eliminates the dominant O(n) traversal at the final merge level for
+//    well-separated inputs.
+//
+// 3. Parallel Phase 3 via CUB tile-based propagation scan — replaces the
+//    serial fill-from-block-start loop with a fully parallel scan using
+//    PropagateOp.  TempStorage is O(T) shared memory, independent of n.
+//    Works correctly for n >> 1024 via the tiled carry (running_val).
+//
+// The kernel is always launched with exactly 512 threads (tpb = 512), so
+// tpb_p2 is always 256.  For n < 512, extra threads idle in Phase 2a/2b
+// and fall through the strided loops in Phases 1 and 3.
+// Using 512 instead of 1024 threads doubles the register budget per thread
+// (128 vs 64 on SM90), avoiding cudaErrorLaunchOutOfResources with the
+// complex VF CUB scan for double precision.
+// ---------------------------------------------------------------------------
 template <typename scalar_t>
 __global__ void isotonic_l2_parallel_kernel(
     torch::PackedTensorAccessor32<scalar_t, 2, torch::RestrictPtrTraits> s,
     torch::PackedTensorAccessor32<scalar_t, 2, torch::RestrictPtrTraits> sol,
     torch::PackedTensorAccessor32<scalar_t, 2, torch::RestrictPtrTraits> sums,
-    torch::PackedTensorAccessor32<scalar_t, 2, torch::RestrictPtrTraits> target,
+    torch::PackedTensorAccessor32<int32_t,  2, torch::RestrictPtrTraits> target,
     torch::PackedTensorAccessor32<scalar_t, 2, torch::RestrictPtrTraits> c,
+    torch::PackedTensorAccessor32<int32_t,  2, torch::RestrictPtrTraits> is_bs,
     int n,
     int batch) {
-    // Each block handles one sequence in the batch.
-    // Threads within a block cooperate on that sequence.
-    const int b   = blockIdx.x;          // batch index
-    const int tid = threadIdx.x;         // lane within the sequence
-    const int tpb = blockDim.x;          // threads_per_seq (e.g. 256)
+
+    // 1KB: last block start per Phase-2a chunk (tpb_p2 = 256 slots).
+    __shared__ int sh_last_block[256];
+
+    // O(T) shared memory for the Phase 3 CUB scan, independent of n.
+    typedef ValFlag<scalar_t>    VF;
+    typedef PropagateOp<scalar_t> PO;
+    typedef cub::BlockScan<VF, 512, cub::BLOCK_SCAN_RAKING> Phase3Scan;
+    __shared__ typename Phase3Scan::TempStorage phase3_temp;
+
+    const int b      = blockIdx.x;
+    const int tid    = threadIdx.x;
+    const int tpb    = blockDim.x;   // always 512
+    const int tpb_p2 = 256;          // prev power-of-2 of 512
 
     if (b >= batch) return;
 
     // ------------------------------------------------------------------
     // Phase 1 (parallel): initialise c, sol, sums, target
-    // Each thread handles a strided slice of [0, n).
     // ------------------------------------------------------------------
     for (int i = tid; i < n; i += tpb) {
         c[b][i]      = static_cast<scalar_t>(1);
@@ -331,14 +391,8 @@ __global__ void isotonic_l2_parallel_kernel(
     __syncthreads();
 
     // ------------------------------------------------------------------
-    // Phase 2 (parallel): divide-and-conquer PAV
-    // ------------------------------------------------------------------
-
-    // Getting previous power-of-2 for binary tree reduction, some threads sit idle
-    const int tpb_p2 = 1 << (31 - __clz(tpb));
-
-    // ------------------------------------------------------------------
-    // Phase 2a: each thread runs independent PAV on its chunk
+    // Phase 2a: each thread runs independent PAV on its chunk,
+    //           then records the last block start in sh_last_block.
     // ------------------------------------------------------------------
     if (tid < tpb_p2) {
         const int remainder   = n % tpb_p2;
@@ -349,38 +403,43 @@ __global__ void isotonic_l2_parallel_kernel(
 
         int i = chunk_start;
         while (i < chunk_end) {
-            auto k = target[b][i] + 1;
-            if (k == chunk_end) break;
-            if (sol[b][i] > sol[b][k]) {  // non-increasing: no violation, advance
-                i = k;
-                continue;
-            }
+            int k = target[b][i] + 1;
+            if (k >= chunk_end) break;
+            if (sol[b][i] > sol[b][k]) { i = k; continue; }
             auto sum_y = sums[b][i];
             auto sum_c = c[b][i];
             while (true) {
-                auto prev_y  = sol[b][k];
-                sum_y       += sums[b][k];
-                sum_c       += c[b][k];
-                k            = target[b][k] + 1;
-                if ((k == chunk_end) || (prev_y > sol[b][k])) {
+                int k_start  = k;                // start of block being absorbed
+                auto prev_y  = sol[b][k_start];
+                sum_y       += sums[b][k_start];
+                sum_c       += c[b][k_start];
+                k            = target[b][k_start] + 1;
+                is_bs[b][k_start] = 0;           // k_start absorbed; no longer a block start
+                if ((k >= chunk_end) || (prev_y > sol[b][k])) {
                     sol[b][i]        = sum_y / sum_c;
                     sums[b][i]       = sum_y;
                     c[b][i]          = sum_c;
                     target[b][i]     = k - 1;
                     target[b][k - 1] = i;
-                    if (i > chunk_start) {
-                        i = target[b][i - 1];
-                    }
+                    if (i > chunk_start) i = target[b][i - 1];
                     break;
                 }
             }
         }
+        sh_last_block[tid] = i;   // start of last PAV block in this chunk
     }
-
     __syncthreads();
 
     // ------------------------------------------------------------------
-    // Phase 2b: merge levels
+    // Phase 2b: binary-tree merge.
+    //
+    // Key optimisation: start each merge at the LEFT region's last block
+    // (sh_last_block[tid]) rather than at left_start.  Since the left
+    // region is already non-increasing, the only possible violation is at
+    // the boundary with the right region.
+    //
+    // If sol[last_left] > sol[first_right]: no violation → O(1) update.
+    // Otherwise: run PAV from last_left across the combined region.
     // ------------------------------------------------------------------
     for (int stride = 1; stride < tpb_p2; stride <<= 1) {
         if (tid < tpb_p2 && (tid % (2 * stride)) == 0) {
@@ -396,137 +455,172 @@ __global__ void isotonic_l2_parallel_kernel(
                                         : right_tid_end * chunk_base + (right_tid_end < remainder ? right_tid_end : remainder);
 
             if (right_start < n) {
-                int i = left_start;
-                while (i < right_end) {
-                    int k = target[b][i] + 1;
-                    if (k == right_end) break;
-                    if (sol[b][i] > sol[b][k]) {  // non-increasing: no violation, advance
-                        i = k;
-                        continue;
-                    }
-                    // violation: sol[i] <= sol[k], merge
-                    auto sum_y = sums[b][i];
-                    auto sum_c = c[b][i];
-                    while (true) {
-                        auto prev_y  = sol[b][k];
-                        sum_y       += sums[b][k];
-                        sum_c       += c[b][k];
-                        k            = target[b][k] + 1;
-                        if ((k == right_end) || (prev_y > sol[b][k])) {
-                            sol[b][i]        = sum_y / sum_c;
-                            sums[b][i]       = sum_y;
-                            c[b][i]          = sum_c;
-                            target[b][i]     = k - 1;
-                            target[b][k - 1] = i;
-                            if (i > left_start) {
-                                i = target[b][i - 1];
+                int i = sh_last_block[tid];   // jump to last block of left region
+                int k = target[b][i] + 1;    // first block of right region
+
+                if (k >= right_end) {
+                    // Right region is empty or left already covers it — nothing to do.
+                } else if (sol[b][i] > sol[b][k]) {
+                    // No violation at boundary: combined region is already non-increasing.
+                    // O(1): inherit right region's last block.
+                    sh_last_block[tid] = sh_last_block[right_tid];
+                } else {
+                    // Violation: run PAV from i across the combined [left_start, right_end).
+                    while (i < right_end) {
+                        k = target[b][i] + 1;
+                        if (k >= right_end) { sh_last_block[tid] = i; break; }
+                        if (sol[b][i] > sol[b][k]) { i = k; continue; }
+                        auto sum_y = sums[b][i];
+                        auto sum_c = c[b][i];
+                        while (true) {
+                            int k_start  = k;
+                            auto prev_y  = sol[b][k_start];
+                            sum_y       += sums[b][k_start];
+                            sum_c       += c[b][k_start];
+                            k            = target[b][k_start] + 1;
+                            is_bs[b][k_start] = 0;
+                            if ((k >= right_end) || (prev_y > sol[b][k])) {
+                                sol[b][i]        = sum_y / sum_c;
+                                sums[b][i]       = sum_y;
+                                c[b][i]          = sum_c;
+                                target[b][i]     = k - 1;
+                                target[b][k - 1] = i;
+                                if (i > left_start) i = target[b][i - 1];
+                                break;
                             }
-                            break;
                         }
                     }
                 }
             }
         }
-
         __syncthreads();
     }
-    
-    // Sync threads before reconstruction
     __syncthreads();
 
     // ------------------------------------------------------------------
-    // Phase 3 (parallel): reconstruct — fill each block's constant value.
+    // Phase 3: parallel reconstruction via tiled CUB propagation scan.
     //
-    // Strategy: every thread that owns position i (i.e. i % tpb == tid)
-    // checks whether it is the START of a block (target[b][i-1]+1 == i
-    // or i==0) and if so, writes sol[b][i] to all j in [i+1, target[b][i]).
-    // This avoids any write conflicts because blocks are disjoint.
+    // After Phase 2b, sol[b][i] is correct only at block starts.  We need
+    // to fill every position with its block start's value.
     //
-    // Edge cases:
-    // * If a block spans fewer elements than tpb, some threads simply
-    //   own no start index and do nothing
-    // * Singleton blocks (target[b][i] == i) produce an empty inner loop
+    // We scan (value, is_block_start) pairs with PropagateOp: values flow
+    // rightward from block starts, stopping at each new block start.
+    //
+    // Tiled carry: running_val carries the last propagated value across
+    // tile boundaries.  Thread 0 of each tile injects it as a virtual
+    // block start when its own position is not a real block start.
     // ------------------------------------------------------------------
-    for (int i = tid; i < n; i += tpb) {
-        // Is i the start of a PAV block?
-        bool is_start = (i == 0) || (target[b][i - 1] + 1 == i);
-        if (is_start) {
-            int end = target[b][i] + 1;   // exclusive end of this block
-            scalar_t val = sol[b][i];
-            for (int j = i + 1; j < end; j++) {
-                sol[b][j] = val;
-            }
+    scalar_t running_val = static_cast<scalar_t>(0);  // carry across tiles
+
+    for (int tile_start = 0; tile_start < n; tile_start += tpb) {
+        int idx = tile_start + tid;
+
+        VF elem;
+        if (idx < n) {
+            // is_bs[b][idx] == 1 iff idx is a PAV block start; maintained
+            // exactly by the Phase-2a/2b inner loops (absorbed starts cleared to 0).
+            bool is_start = (bool)is_bs[b][idx];
+            elem.val  = is_start ? sol[b][idx] : static_cast<scalar_t>(0);
+            elem.flag = is_start ? 1 : 0;
+        } else {
+            elem = {static_cast<scalar_t>(0), 0};
         }
+
+        // Thread 0: if not a block start, inject the previous tile's carry
+        // so all subsequent non-starts in this tile inherit it correctly.
+        if (tid == 0 && !elem.flag) {
+            elem.val  = running_val;
+            elem.flag = 1;
+        }
+
+        VF scan_out, tile_agg;
+        Phase3Scan(phase3_temp).InclusiveScan(elem, scan_out, PO(), tile_agg);
+        __syncthreads();   // required before reusing phase3_temp next iteration
+
+        if (idx < n) {
+            sol[b][idx] = scan_out.val;
+        }
+        running_val = tile_agg.val;   // broadcast to all threads by CUB
     }
 }
 
 // ---------------------------------------------------------------------------
-// Parallel prefix-sum (exclusive scan) on a single row of length N,
-// operating entirely in global memory.  Called with B blocks, <=1024 threads.
+// Backward kernel using cub::BlockScan for the inclusive prefix sum.
 //
-// Algorithm: naive O(N log N) work
+// Improvements over the naive Hillis-Steele version:
+//   - O(N) work scan instead of O(N log N): cub::BlockScan uses a
+//     work-efficient algorithm (Blelloch / hybrid) internally.
+//   - Shared memory usage is O(T) (thread count), not O(N), so it stays
+//     well within the 48 KB limit regardless of sequence length.
+//   - pid buffer is int32 instead of scalar_t, avoiding float precision
+//     issues for large pool indices.
+//   - pid_copy scratch buffer is eliminated entirely.
+//
+// Always launched with exactly 1024 threads per block (one block per batch
+// element).  Threads with tid >= N contribute flag=0 and skip all writes.
 // ---------------------------------------------------------------------------
 template <typename scalar_t>
 __global__ void isotonic_l2_backward_parallel_kernel(
     torch::PackedTensorAccessor32<scalar_t, 2, torch::RestrictPtrTraits> sol,
     torch::PackedTensorAccessor32<scalar_t, 2, torch::RestrictPtrTraits> grad_in,
     torch::PackedTensorAccessor32<scalar_t, 2, torch::RestrictPtrTraits> out,
-    torch::PackedTensorAccessor32<scalar_t, 2, torch::RestrictPtrTraits> pid,
-    torch::PackedTensorAccessor32<scalar_t, 2, torch::RestrictPtrTraits> pid_copy,
-    torch::PackedTensorAccessor32<float, 2, torch::RestrictPtrTraits> psum,  // always float
-    torch::PackedTensorAccessor32<float, 2, torch::RestrictPtrTraits> pcnt,  // always float
+    torch::PackedTensorAccessor32<int32_t, 2, torch::RestrictPtrTraits> pid,
+    torch::PackedTensorAccessor32<float, 2, torch::RestrictPtrTraits> psum,
+    torch::PackedTensorAccessor32<float, 2, torch::RestrictPtrTraits> pcnt,
     int N) {
+
+    // BlockScan TempStorage lives in shared memory: O(T) bytes, independent of N.
+    typedef cub::BlockScan<int, 1024> BlockScan;
+    __shared__ typename BlockScan::TempStorage temp_storage;
+
     const int b   = blockIdx.x;
     const int tid = threadIdx.x;
-    const int T   = blockDim.x;
+    const int T   = blockDim.x;   // always 1024
 
-    // Phase 1a: boundary flags into both pid and pid_copy
-    pid[b][0]      = static_cast<scalar_t>(0);
-    pid_copy[b][0] = static_cast<scalar_t>(0);
-    for (int i = tid + 1; i < N; i += T) {
-        scalar_t flag = (fabsf((float)(sol[b][i] - sol[b][i-1])) > 1e-9f)
-                        ? static_cast<scalar_t>(1)
-                        : static_cast<scalar_t>(0);
-        pid[b][i]      = flag;
-        pid_copy[b][i] = flag;
-    }
-    __syncthreads();
+    // Phase 1: compute boundary flags and inclusive prefix sum (= pool IDs).
+    // Tile-based loop: each tile of T elements is scanned with one BlockScan
+    // call, accumulating a running offset across tiles so that pool IDs are
+    // globally correct across the full sequence of length N.
+    int running_offset = 0;
+    for (int tile_start = 0; tile_start < N; tile_start += T) {
+        int idx = tile_start + tid;
 
-    // Phase 1b: parallel inclusive prefix sum
-    // Each stride pass reads from pid_copy, writes to pid, then swaps.
-    for (int stride = 1; stride < N; stride <<= 1) {
-        for (int i = tid; i < N; i += T) {
-            pid[b][i] = (i >= stride)
-                        ? pid_copy[b][i] + pid_copy[b][i - stride]
-                        : pid_copy[b][i];
+        // Threads beyond the end of the sequence contribute 0.
+        int flag = 0;
+        if (idx > 0 && idx < N) {
+            flag = (fabsf((float)(sol[b][idx] - sol[b][idx - 1])) > 1e-9f) ? 1 : 0;
         }
-        __syncthreads();
 
-        // swap: copy pid back into pid_copy for next stride
-        for (int i = tid; i < N; i += T)
-            pid_copy[b][i] = pid[b][i];
-        __syncthreads();
-    }
-    // pid[b][i] now holds the pool index for position i
+        // Inclusive sum within this tile; tile_aggregate is broadcast to all threads.
+        int scan_val, tile_aggregate;
+        BlockScan(temp_storage).InclusiveSum(flag, scan_val, tile_aggregate);
+        __syncthreads();  // required before reusing temp_storage next iteration
 
-    // Phase 2: zero psum/pcnt
-    for (int i = tid; i < N; i += T) {
-        psum[b][i] = static_cast<scalar_t>(0);
-        pcnt[b][i] = static_cast<scalar_t>(0);
+        if (idx < N) {
+            pid[b][idx] = scan_val + running_offset;
+        }
+        running_offset += tile_aggregate;
     }
     __syncthreads();
 
-    // Phase 3: accumulate grad into pool buckets
+    // Phase 2: zero psum/pcnt accumulators.
     for (int i = tid; i < N; i += T) {
-        int p = (int)pid[b][i];
+        psum[b][i] = 0.0f;
+        pcnt[b][i] = 0.0f;
+    }
+    __syncthreads();
+
+    // Phase 3: accumulate gradient into per-pool buckets (global atomics).
+    for (int i = tid; i < N; i += T) {
+        int p = pid[b][i];
         atomicAdd(&psum[b][p], (float)grad_in[b][i]);
         atomicAdd(&pcnt[b][p], 1.0f);
     }
     __syncthreads();
 
-    // Phase 4: writeback averaged gradient
+    // Phase 4: write back averaged gradient.
     for (int i = tid; i < N; i += T) {
-        int p     = (int)pid[b][i];
+        int p = pid[b][i];
         out[b][i] = static_cast<scalar_t>(psum[b][p] / (pcnt[b][p] + 1e-12f));
     }
 }
@@ -570,15 +664,19 @@ torch::Tensor isotonic_l2_parallel(torch::Tensor y) {
 
     auto sol    = torch::zeros_like(y);
     auto sums   = torch::zeros_like(y);
-    auto target = torch::zeros_like(y);
+    // target stored as int32: correct semantics, no float-precision issues
+    // for large n, and matches the int32_t kernel parameter.
+    auto target = torch::zeros({batch, n}, torch::dtype(torch::kInt32).device(y.device()));
     auto c      = torch::zeros_like(y);
+    // is_bs[b][i] == 1 iff position i is a PAV block start after Phase 2.
+    // Initialized to all-ones (every position is its own singleton block start).
+    // PAV inner loops clear absorbed starts to 0.
+    auto is_bs  = torch::ones({batch, n}, torch::dtype(torch::kInt32).device(y.device()));
 
-    // One block per batch element; up to threads_per_seq threads per block.
-    // Cap at n so we never launch more threads than elements (also satisfies
-    // the hardware maximum of 1024 threads/block as long as threads_per_seq
-    // <= 1024).
-    const int threads_per_seq = 1024;
-    const int tpb  = std::min((int64_t)threads_per_seq, n);  // handles n < 1024
+    // Always 512 threads to match cub::BlockScan<VF, 512> template parameter.
+    // 512 threads gives 128 registers/thread budget (vs 64 at 1024), needed
+    // to avoid cudaErrorLaunchOutOfResources with the complex VF scan kernel.
+    const int tpb    = 512;
     const int blocks = batch;   // one block = one sequence
 
     AT_DISPATCH_FLOATING_TYPES_AND_HALF(y.scalar_type(), "isotonic_l2_parallel", ([&] {
@@ -586,8 +684,9 @@ torch::Tensor isotonic_l2_parallel(torch::Tensor y) {
             y.packed_accessor32<scalar_t, 2, torch::RestrictPtrTraits>(),
             sol.packed_accessor32<scalar_t, 2, torch::RestrictPtrTraits>(),
             sums.packed_accessor32<scalar_t, 2, torch::RestrictPtrTraits>(),
-            target.packed_accessor32<scalar_t, 2, torch::RestrictPtrTraits>(),
+            target.packed_accessor32<int32_t, 2, torch::RestrictPtrTraits>(),
             c.packed_accessor32<scalar_t, 2, torch::RestrictPtrTraits>(),
+            is_bs.packed_accessor32<int32_t, 2, torch::RestrictPtrTraits>(),
             n,
             batch);
     }));
@@ -651,14 +750,15 @@ torch::Tensor isotonic_l2_backward_parallel(torch::Tensor s, torch::Tensor sol, 
     const int B = sol.size(0);
     const int N = sol.size(1);
 
-    const int tpb    = std::min((int64_t)1024, (int64_t)N);
+    // Always 1024 threads to match the cub::BlockScan<int, 1024> template.
+    const int tpb    = 1024;
     const int blocks = B;
 
-    auto ret          = torch::zeros_like(sol);
-    auto pid_buf      = torch::empty_like(sol);
-    auto pid_copy_buf = torch::empty_like(sol);
+    auto ret     = torch::zeros_like(sol);
+    // pid uses int32 — avoids float precision issues for large pool indices
+    // and eliminates the old pid_copy scratch buffer entirely.
+    auto pid_buf = torch::empty({B, N}, torch::dtype(torch::kInt32).device(sol.device()));
 
-    // float32 for accumulation
     auto float_opts = torch::dtype(torch::kFloat32).device(sol.device());
     auto psum_buf   = torch::zeros({B, N}, float_opts);
     auto pcnt_buf   = torch::zeros({B, N}, float_opts);
@@ -668,8 +768,7 @@ torch::Tensor isotonic_l2_backward_parallel(torch::Tensor s, torch::Tensor sol, 
             sol.packed_accessor32<scalar_t, 2, torch::RestrictPtrTraits>(),
             grad_input.packed_accessor32<scalar_t, 2, torch::RestrictPtrTraits>(),
             ret.packed_accessor32<scalar_t, 2, torch::RestrictPtrTraits>(),
-            pid_buf.packed_accessor32<scalar_t, 2, torch::RestrictPtrTraits>(),
-            pid_copy_buf.packed_accessor32<scalar_t, 2, torch::RestrictPtrTraits>(),
+            pid_buf.packed_accessor32<int32_t, 2, torch::RestrictPtrTraits>(),
             psum_buf.packed_accessor32<float, 2, torch::RestrictPtrTraits>(),
             pcnt_buf.packed_accessor32<float, 2, torch::RestrictPtrTraits>(),
             N

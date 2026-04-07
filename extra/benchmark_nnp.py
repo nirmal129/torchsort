@@ -1,4 +1,5 @@
 import sys
+import csv
 from collections import defaultdict
 from timeit import timeit
 import time
@@ -11,6 +12,8 @@ import os
 import gc
 
 import torchsort
+
+from functools import partial; print = partial(print, flush=True)
 
 def fix_seed(seed=42):
     # 1. Python's built-in random module
@@ -47,15 +50,51 @@ def fix_seed(seed=42):
 #     print("pip install git+https://github.com/google-research/fast-soft-sort")
 #     sys.exit()
 
-init_len, final_len, step_len = 500, 20000, 500
+init_len, final_len, step_len = 2500, 100000, 2500
 N = list(range(init_len, final_len + step_len, step_len))
 B = [2 ** i for i in range(9)]
 B_CUDA = [2 ** i for i in range(13)]
 SAMPLES = 100
-CONVERT = 1e-6  # convert seconds to micro-seconds
+WARMUP  = 10     # per-measurement warm-up calls
+CONVERT = 1e-6   # seconds → microseconds
 
 def time_fn(f):
+    """CPU timing: timeit is accurate (CPU ops are synchronous)."""
+    for _ in range(WARMUP):
+        f()
     return timeit(f, number=SAMPLES) / SAMPLES / CONVERT
+
+
+def time_fn_cuda(f):
+    """GPU timing via CUDA events.
+
+    CUDA kernels are asynchronous: without synchronization, timeit only
+    measures kernel-launch overhead (a few μs), not actual execution time.
+    CUDA events are recorded on the GPU stream and give the true elapsed
+    time between them, independent of CPU-side scheduling jitter.
+
+    A per-call warm-up ensures the first few runs (which may include
+    CUDA-graph warm-up, cache fills, or JIT recompilation) are excluded
+    from the timing window.
+    """
+    # warm up: let CUDA JIT, allocate caches, etc.
+    for _ in range(WARMUP):
+        f()
+    torch.cuda.synchronize()   # flush warm-up work before starting the clock
+
+    start_event = torch.cuda.Event(enable_timing=True)
+    end_event   = torch.cuda.Event(enable_timing=True)
+
+    start_event.record()
+    for _ in range(SAMPLES):
+        f()
+    end_event.record()
+
+    # synchronize: block until the GPU has finished all recorded work
+    torch.cuda.synchronize()
+
+    # elapsed_time returns milliseconds; convert to microseconds
+    return start_event.elapsed_time(end_event) / SAMPLES * 1e3
 
 
 def backward(f, x):
@@ -127,30 +166,32 @@ def batch_size_cuda(ax):
     print("Benchmarking batch sizes")
     L = 512
     for b in B_CUDA:
-        print(f"Batch size {b} done")
+        print(f"Batch size {b} running...")
         x = torch.randn(b, L).cuda()
         x_seq = x.clone()
         x_par = x.clone()
 
-        data["torch.sort"].append(time_fn(lambda: torch.sort(x_seq)))
-        data["torchsort_parallel"].append(time_fn(lambda: torchsort.soft_sort_parallel(x_par)))
-        data["torchsort"].append(time_fn(lambda: torchsort.soft_sort(x_seq)))
+        data["torch.sort"].append(time_fn_cuda(lambda: torch.sort(x_seq)))
+        data["torchsort_parallel"].append(time_fn_cuda(lambda: torchsort.soft_sort_parallel(x_par)))
+        data["torchsort"].append(time_fn_cuda(lambda: torchsort.soft_sort(x_seq)))
 
         x = torch.randn(b, L, requires_grad=True).cuda()
         x_seq = x.clone().detach().requires_grad_(True)
         x_par = x.clone().detach().requires_grad_(True)
 
         data["torchsort_parallel (with backward)"].append(
-            time_fn(lambda: backward(torchsort.soft_sort_parallel, x_par))
+            time_fn_cuda(lambda: backward(torchsort.soft_sort_parallel, x_par))
         )
         data["torchsort (with backward)"].append(
-            time_fn(lambda: backward(torchsort.soft_sort, x_seq))
+            time_fn_cuda(lambda: backward(torchsort.soft_sort, x_seq))
         )
+        print(f"  Batch size {b} done")
     for label in data.keys():
         ax.plot(B_CUDA, data[label], label=label, **style(label))
     ax.set_xlabel("Batch Size")
     ax.set_ylabel("Execution Time (μs)")
     ax.legend()
+    return data
 
 
 def sequence_length_cuda(ax):
@@ -158,32 +199,32 @@ def sequence_length_cuda(ax):
     print("Benchmarking sequence lengths")
     B = 4
     for n in N:
-        print(f"Sequence length {n} running")
+        print(f"Sequence length {n} running...")
         x_init = torch.randn(B, n).cuda()
-        x = x_init # torch.sort(x_init, descending=True)
-        x_seq = x.clone() # x.values.clone()
-        x_par = x.clone() # x.values.clone()
+        x_seq = x_init.clone()
+        x_par = x_init.clone()
 
-        data["torch.sort"].append(time_fn(lambda: torch.sort(x_seq)))
-        data["torchsort_parallel"].append(time_fn(lambda: torchsort.soft_sort_parallel(x_par)))
-        data["torchsort"].append(time_fn(lambda: torchsort.soft_sort(x_seq)))
+        data["torch.sort"].append(time_fn_cuda(lambda: torch.sort(x_seq)))
+        data["torchsort_parallel"].append(time_fn_cuda(lambda: torchsort.soft_sort_parallel(x_par)))
+        data["torchsort"].append(time_fn_cuda(lambda: torchsort.soft_sort(x_seq)))
 
         x_init = torch.randn(B, n, requires_grad=True).cuda()
-        x = x_init # torch.sort(x_init, descending=True)
-        x_seq = x.clone().detach().requires_grad_(True) # x.values.clone().detach().requires_grad_(True)
-        x_par = x.clone().detach().requires_grad_(True) # x.values.clone().detach().requires_grad_(True)
+        x_seq = x_init.clone().detach().requires_grad_(True)
+        x_par = x_init.clone().detach().requires_grad_(True)
 
         data["torchsort_parallel (with backward)"].append(
-            time_fn(lambda: backward(torchsort.soft_sort_parallel, x_par))
+            time_fn_cuda(lambda: backward(torchsort.soft_sort_parallel, x_par))
         )
         data["torchsort (with backward)"].append(
-            time_fn(lambda: backward(torchsort.soft_sort, x_seq))
+            time_fn_cuda(lambda: backward(torchsort.soft_sort, x_seq))
         )
+        print(f"  Sequence length {n} done")
     for label in data.keys():
         ax.plot(N, data[label], label=label, **style(label))
     ax.set_xlabel("Sequence Length")
     ax.set_ylabel("Execution Time (μs)")
     ax.legend()
+    return data
 
 
 if __name__ == "__main__":
@@ -211,8 +252,36 @@ if __name__ == "__main__":
         print("--- Warm up done ---")
 
         fig, (ax1, ax2) = plt.subplots(figsize=(10, 4), ncols=2)
-        sequence_length_cuda(ax1)
-        batch_size_cuda(ax2)
+        seq_data   = sequence_length_cuda(ax1)   # fixed batch=4, varies N
+        batch_data = batch_size_cuda(ax2)         # fixed seq_len=512, varies B_CUDA
         fig.suptitle("Torchsort Benchmark: CUDA")
         fig.tight_layout()
         plt.savefig("extra/benchmark_cuda_nnp.png")
+
+        # --- Save results to CSV ------------------------------------------
+        # Columns: sequence_length, batch_size, torch.sort, torchsort,
+        #          torchsort_parallel  (all times in μs, forward pass only)
+        csv_path = "extra/benchmark_nnp.csv"
+        with open(csv_path, "w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                "sequence_length", "batch_size",
+                "torch.sort", "torchsort", "torchsort_parallel",
+            ])
+            # Sequence-length sweep (batch_size fixed at 4)
+            for i, n in enumerate(N):
+                writer.writerow([
+                    n, 4,
+                    seq_data["torch.sort"][i],
+                    seq_data["torchsort"][i],
+                    seq_data["torchsort_parallel"][i],
+                ])
+            # Batch-size sweep (sequence_length fixed at 512)
+            for i, b in enumerate(B_CUDA):
+                writer.writerow([
+                    512, b,
+                    batch_data["torch.sort"][i],
+                    batch_data["torchsort"][i],
+                    batch_data["torchsort_parallel"][i],
+                ])
+        print(f"CSV saved to {csv_path}")
