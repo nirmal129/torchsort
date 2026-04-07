@@ -28,6 +28,8 @@ try:
 
     from .isotonic_cuda import isotonic_l2_parallel as isotonic_l2_cuda_parallel
     from .isotonic_cuda import isotonic_l2_backward_parallel as isotonic_l2_backward_cuda_parallel
+    from .isotonic_cuda import isotonic_kl_parallel as isotonic_kl_cuda_parallel
+    from .isotonic_cuda import isotonic_kl_backward_parallel as isotonic_kl_backward_cuda_parallel
 except ImportError:
 
     def _error(*args, **kwargs):
@@ -44,6 +46,8 @@ except ImportError:
 
     isotonic_l2_parallel = _error
     isotonic_l2_backward_parallel = _error
+    isotonic_kl_cuda_parallel = _error
+    isotonic_kl_backward_cuda_parallel = _error
 
 
 def soft_rank(values, regularization="l2", regularization_strength=1.0):
@@ -78,7 +82,7 @@ def soft_sort_parallel(values, regularization="l2", regularization_strength=1.0)
 
 
 isotonic_l2 = {"cpu": isotonic_l2_cpu, "cuda": isotonic_l2_cuda, "cuda_parallel": isotonic_l2_cuda_parallel}
-isotonic_kl = {"cpu": isotonic_kl_cpu, "cuda": isotonic_kl_cuda}
+isotonic_kl = {"cpu": isotonic_kl_cpu, "cuda": isotonic_kl_cuda, "cuda_parallel": isotonic_kl_cuda_parallel}
 isotonic_l2_backward = {
     "cpu": isotonic_l2_backward_cpu,
     "cuda": isotonic_l2_backward_cuda,
@@ -87,6 +91,7 @@ isotonic_l2_backward = {
 isotonic_kl_backward = {
     "cpu": isotonic_kl_backward_cpu,
     "cuda": isotonic_kl_backward_cuda,
+    "cuda_parallel": isotonic_kl_backward_cuda_parallel,
 }
 
 
@@ -188,7 +193,6 @@ class SoftRank_Parallel(torch.autograd.Function):
         inv_permutation = _inv_permutation(permutation)
 
         assert s.device.type == "cuda"
-        assert ctx.regularization == "l2"
 
         if ctx.regularization == "l2":
             # dual_sol = isotonic_l2[s.device.type](s - w)
@@ -196,7 +200,7 @@ class SoftRank_Parallel(torch.autograd.Function):
             ret = (s - dual_sol).gather(1, inv_permutation)
             factor = torch.tensor(1.0, device=s.device)
         else:
-            dual_sol = isotonic_kl[s.device.type](s, torch.log(w))
+            dual_sol = isotonic_kl["cuda_parallel"](s, torch.log(w))
             ret = torch.exp((s - dual_sol).gather(1, inv_permutation))
             factor = ret
 
@@ -212,7 +216,7 @@ class SoftRank_Parallel(torch.autograd.Function):
                 s, dual_sol, grad.gather(1, permutation)
             ).gather(1, inv_permutation)
         else:
-            grad -= isotonic_kl_backward[s.device.type](
+            grad -= isotonic_kl_backward["cuda_parallel"](
                 s, dual_sol, grad.gather(1, permutation)
             ).gather(1, inv_permutation)
         return grad * ctx.scale, None, None
@@ -228,14 +232,13 @@ class SoftSort_Parallel(torch.autograd.Function):
         s, permutation = torch.sort(tensor, descending=True)
 
         assert s.device.type == "cuda"
-        assert ctx.regularization == "l2"
 
         # note reverse order of args
         if ctx.regularization == "l2":
             # sol = isotonic_l2[s.device.type](w - s)
             sol = isotonic_l2["cuda_parallel"](w - s)
         else:
-            sol = isotonic_kl[s.device.type](w, s)
+            sol = isotonic_kl["cuda_parallel"](w, s)
         ctx.save_for_backward(s, sol, permutation)
         return ctx.sign * (w - sol)
 
@@ -246,5 +249,5 @@ class SoftSort_Parallel(torch.autograd.Function):
         if ctx.regularization == "l2":
             grad = isotonic_l2_backward["cuda_parallel"](s, sol, grad_output)
         else:
-            grad = isotonic_kl_backward[s.device.type](s, sol, grad_output)
+            grad = isotonic_kl_backward["cuda_parallel"](s, sol, grad_output)
         return grad.gather(1, inv_permutation), None, None

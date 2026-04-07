@@ -13,7 +13,7 @@ BATCH_SIZE = 8
 SEQ_LEN = 10
 
 # REGULARIZATION = ["l2", "kl"]
-REGULARIZATION = ["l2"]
+REGULARIZATION = ["l2", "kl"]
 REGULARIZATION_STRENGTH = [1e-1, 1e0, 1e1]
 
 # use CPU, and up to two CUDA devices

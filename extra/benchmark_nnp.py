@@ -1,4 +1,5 @@
 import sys
+import argparse
 import csv
 from collections import defaultdict
 from timeit import timeit
@@ -161,10 +162,12 @@ def sequence_length(ax):
     ax.legend()
 
 
-def batch_size_cuda(ax):
+def batch_size_cuda(ax, reg):
     data = defaultdict(list)
     print("Benchmarking batch sizes")
     L = 512
+    sort_seq   = lambda x: torchsort.soft_sort(x, regularization=reg)
+    sort_par   = lambda x: torchsort.soft_sort_parallel(x, regularization=reg)
     for b in B_CUDA:
         print(f"Batch size {b} running...")
         x = torch.randn(b, L).cuda()
@@ -172,18 +175,18 @@ def batch_size_cuda(ax):
         x_par = x.clone()
 
         data["torch.sort"].append(time_fn_cuda(lambda: torch.sort(x_seq)))
-        data["torchsort_parallel"].append(time_fn_cuda(lambda: torchsort.soft_sort_parallel(x_par)))
-        data["torchsort"].append(time_fn_cuda(lambda: torchsort.soft_sort(x_seq)))
+        data["torchsort_parallel"].append(time_fn_cuda(lambda: sort_par(x_par)))
+        data["torchsort"].append(time_fn_cuda(lambda: sort_seq(x_seq)))
 
         x = torch.randn(b, L, requires_grad=True).cuda()
         x_seq = x.clone().detach().requires_grad_(True)
         x_par = x.clone().detach().requires_grad_(True)
 
         data["torchsort_parallel (with backward)"].append(
-            time_fn_cuda(lambda: backward(torchsort.soft_sort_parallel, x_par))
+            time_fn_cuda(lambda: backward(sort_par, x_par))
         )
         data["torchsort (with backward)"].append(
-            time_fn_cuda(lambda: backward(torchsort.soft_sort, x_seq))
+            time_fn_cuda(lambda: backward(sort_seq, x_seq))
         )
         print(f"  Batch size {b} done")
     for label in data.keys():
@@ -194,10 +197,12 @@ def batch_size_cuda(ax):
     return data
 
 
-def sequence_length_cuda(ax):
+def sequence_length_cuda(ax, reg):
     data = defaultdict(list)
     print("Benchmarking sequence lengths")
     B = 4
+    sort_seq   = lambda x: torchsort.soft_sort(x, regularization=reg)
+    sort_par   = lambda x: torchsort.soft_sort_parallel(x, regularization=reg)
     for n in N:
         print(f"Sequence length {n} running...")
         x_init = torch.randn(B, n).cuda()
@@ -205,18 +210,18 @@ def sequence_length_cuda(ax):
         x_par = x_init.clone()
 
         data["torch.sort"].append(time_fn_cuda(lambda: torch.sort(x_seq)))
-        data["torchsort_parallel"].append(time_fn_cuda(lambda: torchsort.soft_sort_parallel(x_par)))
-        data["torchsort"].append(time_fn_cuda(lambda: torchsort.soft_sort(x_seq)))
+        data["torchsort_parallel"].append(time_fn_cuda(lambda: sort_par(x_par)))
+        data["torchsort"].append(time_fn_cuda(lambda: sort_seq(x_seq)))
 
         x_init = torch.randn(B, n, requires_grad=True).cuda()
         x_seq = x_init.clone().detach().requires_grad_(True)
         x_par = x_init.clone().detach().requires_grad_(True)
 
         data["torchsort_parallel (with backward)"].append(
-            time_fn_cuda(lambda: backward(torchsort.soft_sort_parallel, x_par))
+            time_fn_cuda(lambda: backward(sort_par, x_par))
         )
         data["torchsort (with backward)"].append(
-            time_fn_cuda(lambda: backward(torchsort.soft_sort, x_seq))
+            time_fn_cuda(lambda: backward(sort_seq, x_seq))
         )
         print(f"  Sequence length {n} done")
     for label in data.keys():
@@ -228,40 +233,34 @@ def sequence_length_cuda(ax):
 
 
 if __name__ == "__main__":
-    fix_seed(42)
-    
-    # jit/warmup
-    # x = torch.randn(1, 10, requires_grad=True)
-    # backward(torchsort.soft_sort, x)
-    # backward(fss.soft_sort, x)
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--regularization", choices=["l2", "kl"], default="l2",
+                        help="Regularization type: l2 or kl (default: l2)")
+    args = parser.parse_args()
+    reg = args.regularization
 
-    # fig, (ax1, ax2) = plt.subplots(figsize=(10, 4), ncols=2)
-    # sequence_length(ax1)
-    # batch_size(ax2)
-    # fig.suptitle("Torchsort Benchmark: CPU")
-    # fig.tight_layout()
-    # plt.savefig("extra/benchmark.png")
+    fix_seed(42)
 
     if torch.cuda.is_available():
         # warmup
         x = torch.randn(4, 256, requires_grad=True).cuda()
         x_seq = x.clone().detach().requires_grad_(True)
         x_par = x.clone().detach().requires_grad_(True)
-        backward(torchsort.soft_sort_parallel, x_par)
-        backward(torchsort.soft_sort, x_seq)
+        backward(lambda v: torchsort.soft_sort_parallel(v, regularization=reg), x_par)
+        backward(lambda v: torchsort.soft_sort(v, regularization=reg), x_seq)
         print("--- Warm up done ---")
 
         fig, (ax1, ax2) = plt.subplots(figsize=(10, 4), ncols=2)
-        seq_data   = sequence_length_cuda(ax1)   # fixed batch=4, varies N
-        batch_data = batch_size_cuda(ax2)         # fixed seq_len=512, varies B_CUDA
-        fig.suptitle("Torchsort Benchmark: CUDA")
+        seq_data   = sequence_length_cuda(ax1, reg)   # fixed batch=4, varies N
+        batch_data = batch_size_cuda(ax2, reg)         # fixed seq_len=512, varies B_CUDA
+        fig.suptitle(f"Torchsort Benchmark: CUDA ({reg})")
         fig.tight_layout()
-        plt.savefig("extra/benchmark_cuda_nnp.png")
+        png_path = f"extra/benchmark_cuda_nnp_{reg}.png"
+        plt.savefig(png_path)
+        print(f"PNG saved to {png_path}")
 
         # --- Save results to CSV ------------------------------------------
-        # Columns: sequence_length, batch_size, torch.sort, torchsort,
-        #          torchsort_parallel  (all times in μs, forward pass only)
-        csv_path = "extra/benchmark_nnp.csv"
+        csv_path = f"extra/benchmark_nnp_{reg}.csv"
         with open(csv_path, "w", newline="") as f:
             writer = csv.writer(f)
             writer.writerow([
