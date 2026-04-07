@@ -267,6 +267,7 @@ if __name__ == "__main__":
             writer.writerow([
                 "sequence_length", "batch_size",
                 "torch.sort", "torchsort", "torchsort_parallel",
+                "torchsort (with backward)", "torchsort_parallel (with backward)",
             ])
             # Sequence-length sweep (batch_size fixed at 4)
             for i, n in enumerate(N):
@@ -275,6 +276,8 @@ if __name__ == "__main__":
                     seq_data["torch.sort"][i],
                     seq_data["torchsort"][i],
                     seq_data["torchsort_parallel"][i],
+                    seq_data["torchsort (with backward)"][i],
+                    seq_data["torchsort_parallel (with backward)"][i],
                 ])
             # Batch-size sweep (sequence_length fixed at 512)
             for i, b in enumerate(B_CUDA):
@@ -283,5 +286,7 @@ if __name__ == "__main__":
                     batch_data["torch.sort"][i],
                     batch_data["torchsort"][i],
                     batch_data["torchsort_parallel"][i],
+                    batch_data["torchsort (with backward)"][i],
+                    batch_data["torchsort_parallel (with backward)"][i],
                 ])
         print(f"CSV saved to {csv_path}")
