@@ -17,7 +17,7 @@ import torchsort
 NUM_CLASSES = 10
 
 
-def topk_loss(input, target, regularization="l2", regularization_strength=1.0):
+def topk_loss(input, target, regularization="kl", regularization_strength=1.0):
 
     # TODO: not sure if this is what they mean by logistic map
     # "On the other hand, for top-k classification, we find that applying a
@@ -112,7 +112,6 @@ def main(args):
         nn.ReLU(),
         nn.Linear(512, NUM_CLASSES),
     ).to(args.device)
-    model = torch.compile(model)
 
     loss_fn = (
         F.cross_entropy
@@ -174,8 +173,7 @@ def main(args):
     )
     np.save(f"{args.loss_fn}{regularization}_acc.npy", test_accs)
 
-plt.style.use("bmh")
-palette = plt.rcParams['axes.prop_cycle'].by_key()['color']
+
 def plot():
     def smooth(xs, factor=0.9):
         out = [xs[0]]
@@ -183,13 +181,13 @@ def plot():
             out.append(out[-1] * factor + x * (1 - factor))
         return out
 
-    # colors = ["tab:blue", "tab:orange"]
-    plt.figure(figsize=(8, 5))
+    colors = ["tab:blue", "tab:orange"]
+    plt.figure(figsize=(5, 3))
     for i, file in enumerate(Path("./").glob("*.npy")):
         print(file)
         test_accs = np.load(file)
-        plt.plot(test_accs, alpha=0.1, color=palette[i])
-        plt.plot(smooth(test_accs), color=palette[i], label=file.stem)
+        plt.plot(test_accs, alpha=0.1, color=colors[i])
+        plt.plot(smooth(test_accs), color=colors[i], label=file.stem)
 
     plt.ylim(0.78, 0.88)
     plt.xlabel("Epochs")
@@ -205,14 +203,13 @@ if __name__ == "__main__":
     parser.add_argument(
         "--loss_fn", choices=["cross_entropy", "topk"], default="cross_entropy"
     )
-    parser.add_argument("--regularization", default="l2")
+    parser.add_argument("--regularization", default="kl")
     parser.add_argument("--regularization_strength", type=float, default=1.0)
     parser.add_argument("--hidden_size", type=int, default=64)
     parser.add_argument("--epochs", type=int, default=600)
     parser.add_argument("--plot", action="store_true")
     args = parser.parse_args()
-    # args.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    args.device = torch.device("cuda")
+    args.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     if args.plot:
         plot()
     else:

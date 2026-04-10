@@ -7,12 +7,12 @@ import torch
 
 import torchsort
 
-# try:
-#     import fast_soft_sort.pytorch_ops as fss
-# except ImportError:
-#     print("install fast_soft_sort:")
-#     print("pip install git+https://github.com/google-research/fast-soft-sort")
-#     sys.exit()
+try:
+    import fast_soft_sort.pytorch_ops as fss
+except ImportError:
+    print("install fast_soft_sort:")
+    print("pip install git+https://github.com/google-research/fast-soft-sort")
+    sys.exit()
 
 
 N = list(range(1, 5_000, 100))
@@ -47,14 +47,14 @@ def batch_size(ax):
         x = torch.randn(b, 100)
         data["torch.sort"].append(time(lambda: torch.sort(x)))
         data["torchsort"].append(time(lambda: torchsort.soft_sort(x)))
-        # data["fast_soft_sort"].append(time(lambda: fss.soft_sort(x)))
+        data["fast_soft_sort"].append(time(lambda: fss.soft_sort(x)))
         x = torch.randn(b, 100, requires_grad=True)
         data["torchsort (with backward)"].append(
             time(lambda: backward(torchsort.soft_sort, x))
         )
-        # data["fast_soft_sort (with backward)"].append(
-        #     time(lambda: backward(fss.soft_sort, x))
-        # )
+        data["fast_soft_sort (with backward)"].append(
+            time(lambda: backward(fss.soft_sort, x))
+        )
 
     for label in data.keys():
         ax.plot(B, data[label], label=label, **style(label))
@@ -70,14 +70,14 @@ def sequence_length(ax):
         x = torch.randn(1, n)
         data["torch.sort"].append(time(lambda: torch.sort(x)))
         data["torchsort"].append(time(lambda: torchsort.soft_sort(x)))
-        # data["fast_soft_sort"].append(time(lambda: fss.soft_sort(x)))
+        data["fast_soft_sort"].append(time(lambda: fss.soft_sort(x)))
         x = torch.randn(1, n, requires_grad=True)
         data["torchsort (with backward)"].append(
             time(lambda: backward(torchsort.soft_sort, x))
         )
-        # data["fast_soft_sort (with backward)"].append(
-        #     time(lambda: backward(fss.soft_sort, x))
-        # )
+        data["fast_soft_sort (with backward)"].append(
+            time(lambda: backward(fss.soft_sort, x))
+        )
 
     for label in data.keys():
         ax.plot(N, data[label], label=label, **style(label))
@@ -123,16 +123,16 @@ def sequence_length_cuda(ax):
 
 if __name__ == "__main__":
     # jit/warmup
-    # x = torch.randn(1, 10, requires_grad=True)
-    # backward(torchsort.soft_sort, x)
-    # backward(fss.soft_sort, x)
+    x = torch.randn(1, 10, requires_grad=True)
+    backward(torchsort.soft_sort, x)
+    backward(fss.soft_sort, x)
 
-    # fig, (ax1, ax2) = plt.subplots(figsize=(10, 4), ncols=2)
-    # sequence_length(ax1)
-    # batch_size(ax2)
-    # fig.suptitle("Torchsort Benchmark: CPU")
-    # fig.tight_layout()
-    # plt.savefig("extra/benchmark.png")
+    fig, (ax1, ax2) = plt.subplots(figsize=(10, 4), ncols=2)
+    sequence_length(ax1)
+    batch_size(ax2)
+    fig.suptitle("Torchsort Benchmark: CPU")
+    fig.tight_layout()
+    plt.savefig("extra/benchmark.png")
 
     if torch.cuda.is_available():
         # warmup
@@ -144,4 +144,4 @@ if __name__ == "__main__":
         batch_size_cuda(ax2)
         fig.suptitle("Torchsort Benchmark: CUDA")
         fig.tight_layout()
-        plt.savefig("extra/benchmark_cuda_nnp.png")
+        plt.savefig("extra/benchmark_cuda.png")
